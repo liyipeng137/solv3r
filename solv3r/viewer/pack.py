@@ -470,6 +470,10 @@ class Recorder:
                     c2w[k, j] = c2w[known[0], j] if known else np.eye(4)
         last = self.snaps[-1]
         K = last["K"]
+        if final is not None:
+            c2w[-1] = final["c2w"]
+            K = final["K"]
+            motion[-1] = np.nan       # final camera decoding is not a solver update
         vid = np.repeat(np.arange(V), n)
         img = to_u8(self.images).permute(0, 2, 3, 1).numpy()
         rgb = lift(img[:, self.ys, self.xs].reshape(-1, 3), exposure)

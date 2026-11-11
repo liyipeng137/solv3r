@@ -97,18 +97,26 @@ def unproject(depth, c2w, K):
     return np.einsum("sij,shwj->shwi", c2w[:, :3, :3], cam) + c2w[:, None, None, :3, 3]
 
 
-def save_solve(prefix, images, pred, names=None, keep=1.0, sky=False, html=False, view_keep=1.0):
+def save_solve(prefix, images, pred, names=None, keep=1.0, sky=False, html=False, view_keep=1.0,
+               shared_intrinsics=True, camera_result=None):
     """Saves a decoded solve (Solv3R.decode) as <prefix>.npz (c2w, K, depth, depth_conf) and <prefix>.ply, the points the
     viewer shows (scene_points; view_keep: meta["view_keep"] of the viewer's pack). sky=True leaves the sky out.
-    html=True also writes a simple viewer <prefix>.html (the examples write the demo's viewer with solv3r.viewer)."""
-    from .model import cameras_from_pose_enc
+    html=True also writes a simple viewer <prefix>.html (the examples write the demo's viewer with solv3r.viewer).
+    Final cameras use ray fitting and, by default, shared point-map intrinsics. camera_result can reuse the
+    (c2w, K, report) returned by cameras_from_prediction for the viewer. Raw depth/points are not reprojected."""
+    from .intrinsics import cameras_from_prediction
 
-    hw = tuple(pred["depth"].shape[1:3])
-    c2w, K = cameras_from_pose_enc(pred["pose_enc"], hw)
+    c2w, K, camera_info = (cameras_from_prediction(pred, shared_intrinsics=shared_intrinsics)
+                           if camera_result is None else camera_result)
+    if camera_info["shared_intrinsics"] != shared_intrinsics:
+        raise ValueError("camera_result and shared_intrinsics disagree")
     depth = pred["depth"][..., 0].float().cpu().numpy()
     conf = pred["depth_conf"].float().cpu().numpy()
     np.savez_compressed(f"{prefix}.npz", c2w=c2w.numpy(), K=K.numpy(), depth=depth.astype(np.float16),
-                        depth_conf=conf.astype(np.float16), **({"names": np.array(names)} if names else {}))
+                        depth_conf=conf.astype(np.float16), camera_metadata=np.array(json.dumps(camera_info)),
+                        **({"names": np.array(names)} if names else {}))
+    with open(f"{prefix}.cameras.json", "w") as f:
+        json.dump(camera_info, f, indent=2)
     xyz, rgb = scene_points(pred["world_points"].float().cpu().numpy(), conf, depth, images, keep, sky, view_keep)
     write_ply(f"{prefix}.ply", xyz, rgb)
     if html:

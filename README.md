@@ -49,15 +49,42 @@ The pretrained model is on [🤗 HuggingFace](https://huggingface.co/jgkwak/solv
 ## Quick start
 
 ```python
-from solv3r import Solv3R, cameras_from_pose_enc, list_images, load_images
+from solv3r import Solv3R, cameras_from_prediction, list_images, load_images
 
 model = Solv3R.from_pretrained()                       # the released weights
 images = load_images(list_images("path/to/images"))   # long side 504, sides multiples of 14, no crop
 ctx = model.encode(images)                             # the first image defines the world frame
 z = model.solve(ctx, calls=16)                         # 16 calls of the looped block
 pred = model.decode(z, ctx)                            # depth, depth_conf, rays, world_points, pose_enc
-c2w, K = cameras_from_pose_enc(pred["pose_enc"], (ctx.H, ctx.W))
+c2w, K, camera_info = cameras_from_prediction(pred)     # ray-fitting poses + one shared K (default)
 ```
+
+### Shared intrinsics (default in this fork)
+
+Complete image collections default to a single focal length (`fx=fy`) with the principal point at
+`(W/2,H/2)`. Poses are obtained by equal-weight ray fitting. Raw world points are transformed into those
+camera frames, then all supported views jointly fit the focal using a Huber loss. The fit uses a 64×64
+sample grid, the upper half of each view's depth confidence and pixels away from depth edges; supported
+views have equal initial weight. No LiDAR, supplied calibration, depth shift, BA or solver update is involved.
+Insufficient/degenerate geometry raises an error rather than silently substituting a focal.
+
+This assumes the same lens, zoom/crop and pixel grid. For mixed cameras or varying calibration, pass
+`shared_intrinsics=False` to `cameras_from_prediction` / `save_solve`, or add `--no-shared-intrinsics` to
+the offline, incremental or any-order example. This keeps the **same ray-fitting poses** with per-view K.
+The original camera-head path remains available via `cameras_from_pose_enc(pred["pose_enc"], (ctx.H, ctx.W))`.
+`model.decode`, `decode_cameras`, streaming and the paper's evaluation protocols retain their raw behavior.
+
+The image-collection examples and demo apply the shared fit at finalization (and at each requested stage export).
+For the demo's Python API, `solve_offline`, `solve_stages` and `solve_stochastic` accept `shared_intrinsics=False`;
+continuations retain the session setting. Earlier animation frames show the original camera-head estimates;
+the final viewer frame and exports use the finalized ray-fitting cameras and K.
+NPZ exports include `camera_metadata`; the examples also write `solve.cameras.json` with fitting diagnostics.
+Demo COLMAP exports reuse one camera ID for equal-sized images sharing K; different original pixel sizes need
+separate scaled cameras. COLMAP points still have no feature tracks.
+
+The raw network depth and world points are preserved, so a fitted K does not make the predicted point maps
+exactly pinhole-consistent or guarantee physical calibration. Points are not regenerated from the new K.
+Inference-grid K is scaled to original image dimensions only when exporting the demo's COLMAP model.
 
 The state `z` can be used again at any point:
 

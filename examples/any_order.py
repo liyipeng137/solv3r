@@ -30,6 +30,7 @@ def main():
     ap.add_argument("--keep", type=float, default=1.0, help="fraction of the points in the .ply, the most confident first "
                     "(1: all; points on depth edges always leave), as the demo's confidence filtering")
     ap.add_argument("--every-stage", action="store_true", help="also save the solve after every stage")
+    ap.add_argument("--no-shared-intrinsics", action="store_true", help="keep per-view ray-fitted K")
     a = ap.parse_args()
 
     model = Solv3R.from_pretrained(a.checkpoint)
@@ -39,7 +40,7 @@ def main():
     rest = np.random.default_rng(a.seed).permutation([i for i in range(n) if i not in first]).tolist()
     stages = [first] + [rest[s:s + a.group] for s in range(0, len(rest), a.group)]
     solve_in_stages(model, load_images(paths), stages, a.calls, a.out, [os.path.basename(p) for p in paths], a.sky_mask,
-                    a.every_stage, os.path.basename(os.path.normpath(a.images)), a.keep)
+                    a.every_stage, os.path.basename(os.path.normpath(a.images)), a.keep, not a.no_shared_intrinsics)
 
 
 if __name__ == "__main__":

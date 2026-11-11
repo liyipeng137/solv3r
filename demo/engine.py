@@ -3,6 +3,7 @@
 solve back."""
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -17,7 +18,8 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from solv3r import PRESETS, Solv3R, StreamingSolver, cameras_from_pose_enc, load_images
+from solv3r import (PRESETS, Solv3R, StreamingSolver, cameras_from_pose_enc, cameras_from_prediction,
+                    load_images, recover_shared_intrinsics)
 from solv3r.export import write_ply
 from solv3r.images import _ffmpeg, model_size
 from solv3r.model import Context, autocast
@@ -150,6 +152,7 @@ class Session:
     skymask: np.ndarray | None = None     # (V, H, W) True on sky, computed once
     view_keep: float = 1.0                # share of each view's points the viewer shows (its point budget): exports keep it
     hist: object = None                   # (Recorder, first_snap) of the last solve shown: a continuation plays after it
+    shared_intrinsics: bool = True        # complete image collections; streaming keeps its original camera protocol
 
     @property
     def V(self):
@@ -250,6 +253,10 @@ class Recorder:
                     c2w[k, j] = c2w[known[0], j] if known else np.eye(4)
         last = self.snaps[-1]
         K = last["K"]
+        if final is not None:
+            c2w[-1] = final["c2w"]
+            K = final["K"]
+            motion[-1] = np.nan       # changing camera decoders is not a solver update
         vid = np.repeat(np.arange(V), n)
         img = to_u8(self.images).permute(0, 2, 3, 1).numpy()
         rgb = lift(img[:, self.ys, self.xs].reshape(-1, 3), exposure)
@@ -285,16 +292,23 @@ def finish(sess, m, z, ctx, keep_final=True):
     if not keep_final:
         return
     with torch.no_grad():
-        c2w, K = cameras_from_pose_enc(m.decode_cameras(z, ctx), (ctx.H, ctx.W))
-        depth, conf, wp = [], [], []
+        depth, conf, wp, cameras, intrinsics = [], [], [], [], []
         for a in range(0, z.shape[0], 16):
             idx = list(range(a, min(z.shape[0], a + 16)))
             pred = m.decode(z[idx], ctx.subset(idx))
-            depth.append(pred["depth"][..., 0].float().cpu().numpy().astype(np.float16))
-            conf.append(pred["depth_conf"].float().cpu().numpy().astype(np.float16))
-            wp.append(pred["world_points"].float().cpu().numpy().astype(np.float16))
-    sess.final = dict(c2w=c2w.numpy(), K=K.numpy(), depth=np.concatenate(depth), conf=np.concatenate(conf),
-                      points=np.concatenate(wp))
+            c2w, K, camera_info = cameras_from_prediction(pred, shared_intrinsics=False)
+            cameras.append(c2w.numpy())
+            intrinsics.append(K.numpy())
+            depth.append(pred["depth"][..., 0].float().cpu().numpy())
+            conf.append(pred["depth_conf"].float().cpu().numpy())
+            wp.append(pred["world_points"].float().cpu().numpy())
+    c2w, K = np.concatenate(cameras), np.concatenate(intrinsics)
+    depth, conf, wp = np.concatenate(depth), np.concatenate(conf), np.concatenate(wp)
+    if sess.shared_intrinsics:
+        K, camera_info = recover_shared_intrinsics(wp, c2w, depth, conf)
+        camera_info["pose_source"] = "equal_weight_ray_fitting"
+    sess.final = dict(c2w=c2w, K=K, depth=depth.astype(np.float16), conf=conf.astype(np.float16),
+                      points=wp.astype(np.float16), camera_metadata=camera_info)
 
 
 def _peak(sess):
@@ -334,9 +348,9 @@ def run_calls(sess, m, z, ctx, n, rec=None, dense_at=(), adaptive=None, min_call
 
 
 # ---------------------------------------------------------------------- modes
-def solve_offline(images, labels, paths, calls=16, adaptive=None, max_calls=64, progress=None):
+def solve_offline(images, labels, paths, calls=16, adaptive=None, max_calls=64, progress=None, shared_intrinsics=True):
     m = model()
-    sess = Session(images=to_u8(images), labels=labels, paths=paths, mode="offline")
+    sess = Session(images=to_u8(images), labels=labels, paths=paths, mode="offline", shared_intrinsics=shared_intrinsics)
     if DEV == "cuda":
         torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
@@ -368,13 +382,13 @@ def stages_of(n, initial, group, order="file", seed=0):
     return stages
 
 
-def solve_stages(images, labels, paths, stages, calls=8, progress=None, mode="incremental"):
+def solve_stages(images, labels, paths, stages, calls=8, progress=None, mode="incremental", shared_intrinsics=True):
     """Views join in stages; stage i gets calls[i] calls (or `calls` each), which also update the views solved before."""
     cs = list(calls) if isinstance(calls, (list, tuple)) else [calls] * len(stages)
     m = model()
     order = [i for s in stages for i in s]
     images, labels, paths = images[order], [labels[i] for i in order], [paths[i] for i in order]
-    sess = Session(images=to_u8(images), labels=labels, paths=paths, mode=mode)
+    sess = Session(images=to_u8(images), labels=labels, paths=paths, mode=mode, shared_intrinsics=shared_intrinsics)
     if DEV == "cuda":
         torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
@@ -559,7 +573,7 @@ def solve_stream(paths, labels, config="L8", progress=None, keep=0.5, per_frame=
             live = []
     res = solver.result()
     images = torch.stack(frames)
-    sess = Session(images=images, labels=labels, paths=paths, kind="stream", mode="streaming")
+    sess = Session(images=images, labels=labels, paths=paths, kind="stream", mode="streaming", shared_intrinsics=False)
     sess.calls = len(paths)
     sess.stream = dict(c2w=res.c2w, c2w_exit=res.c2w_exit, K=res.intrinsics, depth=res.depth, conf=res.depth_conf,
                        ms=res.ms_per_frame, refreshed=list(res.refreshed), config=config)
@@ -798,9 +812,9 @@ class Stochastic:
         self._kv(S)
 
 
-def solve_stochastic(images, labels, paths, per_call=8, updates=32, seed=0, progress=None):
+def solve_stochastic(images, labels, paths, per_call=8, updates=32, seed=0, progress=None, shared_intrinsics=True):
     m = model()
-    sess = Session(images=to_u8(images), labels=labels, paths=paths, mode="large")
+    sess = Session(images=to_u8(images), labels=labels, paths=paths, mode="large", shared_intrinsics=shared_intrinsics)
     if DEV == "cuda":
         torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
@@ -869,7 +883,8 @@ def export_npz(sess):
     f = sess.final
     path = os.path.join(new_dir("export"), "solv3r_cameras_depth.npz")
     np.savez_compressed(path, c2w=f["c2w"], K=f["K"], depth=f["depth"], depth_conf=f["conf"],
-                        names=np.array(sess.labels), image_size=np.array(sess.hw))
+                        names=np.array(sess.labels), image_size=np.array(sess.hw),
+                        **({"camera_metadata": np.array(json.dumps(f["camera_metadata"]))} if "camera_metadata" in f else {}))
     return path
 
 
@@ -891,6 +906,8 @@ def export_colmap(sess, keep=1.0, max_points=300_000, with_images=True):
     os.makedirs(sp)
     H, W = sess.hw
     cams, ims = [], []
+    camera_ids = {}
+    shared = f.get("camera_metadata", {}).get("shared_intrinsics", False)
     names = []
     for i in range(sess.V):
         src = sess.paths[i]
@@ -902,13 +919,21 @@ def export_colmap(sess, keep=1.0, max_points=300_000, with_images=True):
         sx, sy = w0 / W, h0 / H
         name = f"{i:05d}_{os.path.basename(src) if src else sess.labels[i] + '.jpg'}"
         names.append(name)
-        cams.append(f"{i + 1} PINHOLE {w0} {h0} {K[0, 0] * sx:.6f} {K[1, 1] * sy:.6f} {K[0, 2] * sx:.6f} {K[1, 2] * sy:.6f}")
+        params = (K[0, 0] * sx, K[1, 1] * sy, K[0, 2] * sx, K[1, 2] * sy)
+        key = (w0, h0, *params) if shared else (i,)
+        if key not in camera_ids:
+            camera_ids[key] = len(camera_ids) + 1
+            cams.append(f"{camera_ids[key]} PINHOLE {w0} {h0} " + " ".join(f"{v:.6f}" for v in params))
+        camera_id = camera_ids[key]
         w2c = np.linalg.inv(f["c2w"][i].astype(np.float64))
         q = _qvec(w2c[:3, :3])
         t = w2c[:3, 3]
-        ims.append(f"{i + 1} {q[0]:.9f} {q[1]:.9f} {q[2]:.9f} {q[3]:.9f} {t[0]:.9f} {t[1]:.9f} {t[2]:.9f} {i + 1} {name}\n")
+        ims.append(f"{i + 1} {q[0]:.9f} {q[1]:.9f} {q[2]:.9f} {q[3]:.9f} {t[0]:.9f} {t[1]:.9f} {t[2]:.9f} {camera_id} {name}\n")
     open(os.path.join(sp, "cameras.txt"), "w").write("# Camera list: CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n" + "\n".join(cams) + "\n")
     open(os.path.join(sp, "images.txt"), "w").write("# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n" + "\n".join(ims))
+    if "camera_metadata" in f:
+        with open(os.path.join(d, "camera_metadata.json"), "w") as fh:
+            json.dump(dict(f["camera_metadata"], colmap_camera_count=len(cams)), fh, indent=2)
     xyz, rgb = confident(sess, keep)
     if len(xyz) > max_points:
         sel = np.random.default_rng(0).choice(len(xyz), max_points, replace=False)
